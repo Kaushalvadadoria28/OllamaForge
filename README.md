@@ -17,7 +17,7 @@ OllamaForge is a powerful full-stack application designed to facilitate seamless
 - **Python / FastAPI**: High-performance API layer.
 - **LangGraph / LangChain**: Advanced orchestration for LLM workflows.
 - **SQLite**: Local persistent storage.
-- **ChromaDB**: Vector database for RAG.
+- **FAISS**: Vector database for RAG.
 
 ### Frontend
 
