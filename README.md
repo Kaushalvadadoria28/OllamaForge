@@ -38,11 +38,19 @@ OllamaForge is a powerful full-stack application designed to facilitate seamless
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/your-username/OllamaForge.git
+   git clone https://github.com/Kaushalvadadoria28/OllamaForge.git
    cd OllamaForge
    ```
 
-2. **Backend Setup**:
+2. **Ollama Setup**:
+   Ensure Ollama is running, then pull the required models:
+
+   ```bash
+   ollama pull llama3
+   ollama pull nomic-embed-text
+   ```
+
+3. **Backend Setup**:
 
    ```bash
    cd OllamaForge_Backend
@@ -52,7 +60,7 @@ OllamaForge is a powerful full-stack application designed to facilitate seamless
    python app.py
    ```
 
-3. **Frontend Setup**:
+4. **Frontend Setup**:
 
    ```bash
    cd ../OllamaForge_Frontend
