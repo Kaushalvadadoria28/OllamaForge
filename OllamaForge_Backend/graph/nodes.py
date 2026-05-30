@@ -2,558 +2,704 @@ from services.llm_service import LLMService
 from services.wikipedia_service import WikipediaService
 from services.website_service import WebsiteService
 import time
+import re
+import concurrent.futures
 from core.graph_logger import log_node_execution
 from core.token_utils import estimate_tokens
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MONITORING DECORATOR
+# ═══════════════════════════════════════════════════════════════════
 
 def monitored_node(node_name):
     def decorator(func):
         def wrapper(state, config):
             start_time = time.time()
-
             input_text = state.get("question", "")
-
             result = func(state, config)
-
             execution_time = time.time() - start_time
+            output_text = (
+                result.get("response", "")
+                if result.get("response")
+                else result.get("tool_output", "")
+            )
 
-            output_text = result.get("response", "")
-
-            # If output_text is a generator (streaming), we can't estimate tokens easily without consuming it.
-            # We skip token estimation for the output in this case to avoid TypeError.
-            if hasattr(output_text, '__iter__') and not isinstance(output_text, (str, list, dict, set)):
+            if hasattr(output_text, "__iter__") and not isinstance(
+                output_text, (str, list, dict, set)
+            ):
                 token_usage = estimate_tokens(input_text)
                 log_output = "<Streamed Response>"
             else:
-                token_usage = estimate_tokens(input_text) + estimate_tokens(output_text)
-                log_output = output_text
+                token_usage = estimate_tokens(input_text) + estimate_tokens(str(output_text))
+                log_output = str(output_text)
+
+            # Safe session_id extraction for both plain dict config and LangGraph RunnableConfig
+            session_id = (
+                config.get("session_id")
+                if isinstance(config, dict)
+                else config.get("configurable", {}).get("session_id")
+            )
 
             log_node_execution(
-                session_id=config.get("session_id"),
+                session_id=session_id,
                 node_name=node_name,
                 input_data=input_text,
                 output_data=log_output,
                 execution_time=execution_time,
-                token_usage=token_usage
+                token_usage=token_usage,
             )
-
             return result
+
         return wrapper
     return decorator
 
-@monitored_node("direct_chat")
-def direct_chat_node(state, config):
-    temperature = config.get("temperature", 0.5)
-    llm = LLMService(config["model"], temperature=temperature)
+
+# ═══════════════════════════════════════════════════════════════════
+# HELPER: TIMEOUT-GUARDED LLM INVOKE
+# ═══════════════════════════════════════════════════════════════════
+
+def _invoke_with_timeout(llm, prompt, timeout_seconds=30):
+    """
+    Wraps llm.invoke() in a thread executor with a hard timeout.
+    Raises concurrent.futures.TimeoutError if the LLM does not
+    respond within timeout_seconds.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(llm.invoke, prompt)
+        return future.result(timeout=timeout_seconds)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HELPER: BUILD DYNAMIC CAPABILITY STATUS BLOCK
+# ═══════════════════════════════════════════════════════════════════
+
+def _build_capability_status(config: dict) -> str:
+    """
+    Generates a real-time status block showing the supervisor
+    exactly which tools are initialised and available for this session.
+    """
+    lines = []
+
+    if config.get("rag"):
+        lines.append("  ✅ RAG   : An uploaded document IS available. For any document-specific question, use 'rag' FIRST.")
+    else:
+        lines.append("  ❌ RAG   : No document has been uploaded. Do NOT choose 'rag'.")
+
+    if config.get("db"):
+        lines.append("  ✅ DB    : A database connection is active. Use 'db' for data/table queries.")
+    else:
+        lines.append("  ❌ DB    : No database connected. Do NOT choose 'db'.")
+
+    if config.get("wikipedia"):
+        lines.append("  ✅ WIKI  : Wikipedia is available for general knowledge lookups.")
+    else:
+        lines.append("  ❌ WIKI  : Wikipedia service is unavailable. Do NOT choose 'wiki'.")
+
+    lines.append("  ✅ WEB   : Website scraping is always available if a URL is provided.")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NODE: SUPERVISOR ROUTER
+# ═══════════════════════════════════════════════════════════════════
+
+@monitored_node("supervisor_router")
+def supervisor_router_node(state: dict, config: dict) -> dict:
+    llm = LLMService(config["model"], temperature=0.1)
+
+    scratchpad = state.get("agent_scratchpad", "")
+    tool_output = state.get("tool_output", "")
+
+    # Append the latest tool observation into the scratchpad
+    # BEFORE calling the LLM so the supervisor sees it in this same cycle.
+    if tool_output:
+        scratchpad += f"\n[Observation]: {tool_output}\n"
+        state["tool_output"] = ""
+
+    # Always persist updated scratchpad before any LLM call
+    state["agent_scratchpad"] = scratchpad
+
+    print(f"--- SUPERVISOR CALLED ---")
+    print(f"Scratchpad length  : {len(scratchpad)}")
+
+    # Count real tool invocations (Observations), not Thoughts
+    MAX_TOOL_CALLS = 4
+    tool_call_count = scratchpad.count("[Observation]")
+    print(f"Tool call count    : {tool_call_count}")
+
+    # Use the source hint on the first decision when available and valid
+    source_hint = config.get("_source_hint", "")
+    if source_hint and not scratchpad and source_hint in {"rag", "db", "wiki", "web"}:
+        if config.get(source_hint):
+            print(f"Supervisor source hint active: {source_hint}")
+            state["next_action"] = source_hint
+            state["agent_scratchpad"] = (
+                scratchpad
+                + f"\n[Thought]: Starting with preferred source '{source_hint}'."
+            )
+            return state
+
+    # Minimum-evidence check before guardrail forces complete
+    EVIDENCE_KEYWORDS = [
+        "Retrieved Context",
+        "Wikipedia Context Found",
+        "SQL Output Raw Data",
+        "Website Direct Scraped",
+        "Website Vector Chunk",
+    ]
+    has_useful_data = any(kw in scratchpad for kw in EVIDENCE_KEYWORDS)
+
+    if tool_call_count >= MAX_TOOL_CALLS:
+        # If we still have no evidence and RAG is available, force one RAG call
+        if not has_useful_data and config.get("rag"):
+            print(">>> GUARDRAIL: No evidence yet — forcing RAG before completing <<<")
+            state["next_action"] = "rag"
+            state["agent_scratchpad"] = (
+                scratchpad
+                + "\n[Thought]: Guardrail override — forcing RAG retrieval before final synthesis."
+            )
+            return state
+
+        print(">>> GUARDRAIL ACTIVATED: FORCING COMPLETE <<<")
+        state["next_action"] = "complete"
+        state["agent_scratchpad"] = (
+            scratchpad
+            + "\n[Thought]: Maximum tool calls reached. Synthesizing from all gathered data."
+        )
+        return state
+
+    # Dynamic capability status injected into the prompt
+    capability_status = _build_capability_status(config)
+
+    # Include discovered workspace context in supervisor prompt
+    workspace_context = state.get("_workspace_context", "")
     
-    system_prompt = state.get("system_prompt", "")
-    stream_flag = state.get("stream", False)
+    # ── NEW: Include SQL file preview if available ──
+    sql_file_context = ""
+    context_clues = state.get("_context_clues", {})
+    if context_clues.get("uploaded_sql_files"):
+        sql_files = context_clues.get("uploaded_sql_files", [])
+        table_count = context_clues.get("uploaded_sql_table_count", 0)
+        sql_size = context_clues.get("uploaded_sql_size", 0)
+        sql_file_context = f"\n**Uploaded SQL Files Available:**\n- Files: {', '.join(sql_files)}\n- Tables: {table_count}\n- Size: {sql_size} bytes"
 
-    # Prune history context (Max 10 messages) to prevent Ollama overflow crashing
-    recent_history = state.get("history", [])[-10:]
+    router_prompt = f"""### TASK: Autonomous Action Routing
+You are an orchestrator leading an agentic workflow. Accurately answer the user's question
+by choosing the best available tool for the next step.
 
-    persona_block = (
-        f"### PERSONA\nYou must embody the following persona for this entire conversation:\n{system_prompt}\n"
-        if system_prompt else ""
-    )
+### DISCOVERED WORKSPACE INTELLIGENCE
+{workspace_context}{sql_file_context}
 
-    history_lines = ""
-    for msg in recent_history:
-        role_label = "User" if msg["role"] == "user" else "Assistant"
-        history_lines += f"{role_label}: {msg['content']}\n"
+### SESSION CAPABILITY STATUS — READ THIS BEFORE DECIDING:
+{capability_status}
 
-    prompt = f"""{persona_block}### CONVERSATION HISTORY
-    {history_lines}
-    ### CURRENT TASK
-    The user has sent a new message. Read the conversation history above for context,
-    then respond to the CURRENT message only. Do not repeat previous answers.
-    Be concise, accurate, and stay in character if a persona is defined.
-    If the question is ambiguous, ask ONE short clarifying question instead of guessing.
+### ROUTING RULES (in priority order):
+1. CRITICAL: DO NOT REPEAT actions. If the Scratchpad already contains a [Observation] from a tool, DO NOT choose that tool again.
+2. If RAG ✅ and the question is about an uploaded document → choose 'rag'. (Skip if 'rag' was already used).
+3. If DB ✅ and the question asks about data tables or database metrics → choose 'db'.
+4. If WIKI ✅ and the question needs broad factual / encyclopedic knowledge → choose 'wiki'.
+5. If a URL is present in the question and WEB is needed → choose 'web'.
+6. If the Scratchpad contains enough data to answer, OR if you need a full document summary and already pulled RAG chunks → choose 'complete'.
+7. If a tool returned an error or empty result → try a DIFFERENT available tool.
 
-    User: {state['question']}
-    Assistant:"""
+### CURRENT WORKING MEMORY (SCRATCHPAD):
+{scratchpad if scratchpad else "No actions taken yet."}
+
+### ORIGINAL USER QUESTION:
+{state['question']}
+
+### RESPONSE FORMAT:
+Reply with exactly ONE word from this list: rag | db | wiki | web | complete
+No punctuation, no markdown, no explanation.
+
+### NEXT ACTION:"""
 
     try:
-        if stream_flag:
-            state["response"] = llm.stream(prompt)
-        else:
-            state["response"] = llm.invoke(prompt)
-    except Exception as e:
-        state["response"] = f"LLM Error: {str(e)}"
+        decision = _invoke_with_timeout(llm, router_prompt, timeout_seconds=30)
+        decision = decision.strip().lower().replace("`", "").replace("'", "").strip()
+
+        valid_actions = ["rag", "db", "wiki", "web", "complete"]
+
+        # Unknown action guard
+        if decision not in valid_actions:
+            decision = "complete"
         
+        if f"Routing to '{decision}'" in scratchpad and decision != "complete":
+            print(f">>> Hard Override: LLM tried to loop '{decision}'. Forcing 'complete'.")
+            decision = "complete"
+
+        # Extra safety: if supervisor picks an unavailable tool, override it
+        if decision == "rag" and not config.get("rag"):
+            decision = "wiki" if config.get("wikipedia") else "complete"
+        if decision == "db" and not config.get("db"):
+            decision = "wiki" if config.get("wikipedia") else "complete"
+        if decision == "wiki" and not config.get("wikipedia"):
+            decision = "rag" if config.get("rag") else "complete"
+
+        state["next_action"] = decision
+        state["agent_scratchpad"] = (
+            scratchpad + f"\n[Thought]: Routing to '{decision}' engine."
+        )
+        print(f"Supervisor decision: {decision}")
+
+    except concurrent.futures.TimeoutError:
+        state["next_action"] = "complete"
+        state["tool_output"] = "Supervisor timed out. Proceeding to synthesize with available data."
+    except Exception as e:
+        state["next_action"] = "complete"
+        state["tool_output"] = f"Supervisor Error: {str(e)}"
+
     return state
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NODE: WIKIPEDIA
+# ═══════════════════════════════════════════════════════════════════
 
 @monitored_node("wikipedia")
 def wikipedia_node(state, config):
-    wiki = WikipediaService()
+    if not config.get("wikipedia"):
+        state["tool_output"] = (
+            "Wikipedia service is unavailable. Try a different tool."
+        )
+        return state
+
+    wiki = config["wikipedia"]
     llm = LLMService(config["model"])
 
-    # 1. Smart Query Extraction
-    # extraction_prompt = f"""
-    # You are an expert search term extractor.
-    # Extract the 1 to 3 best Wikipedia search queries from the user's question.
-    # Output ONLY a comma-separated list of search terms. No explanation or quotes.
-    
-    # User Question: {state['question']}
-    # """
-    
     extraction_prompt = f"""### TASK: Wikipedia Search Query Extraction
+Extract exactly 1 to 2 short keyword search terms from the question.
+Output ONLY a comma-separated list of search terms. No explanation or quotes.
+User Question: {state['question']}
+OUTPUT:"""
 
-    You will receive a user question. Your job is to extract exactly 2 to 3 focused
-    Wikipedia search terms that will together give the best coverage to answer it.
+    try:
+        extracted_str = _invoke_with_timeout(llm, extraction_prompt, timeout_seconds=20)
+        queries = [q.strip() for q in extracted_str.split(",") if q.strip()]
+        if not queries:
+            queries = [state["question"]]
 
-    ### RULES
-    - Return ONLY a comma-separated list. No numbering, no bullets, no explanation.
-    - Each term must be a short noun phrase (2-5 words), not a full sentence.
-    - Prefer specific terms over generic ones (e.g. "Apollo 11 mission" > "space").
-    - If a named entity (person, place, event) is mentioned, always include it as one term.
-    - Do NOT repeat the same concept with different wording.
-    - If the question is already a single clear topic, return 2 terms: the exact topic
-    and one closely related broader concept.
+        all_context = []
+        for q in queries:
+            try:
+                docs = wiki.fetch(q)
+                for d in docs:
+                    all_context.append(f"Title: {d['title']} - Content: {d['content']}")
+            except Exception as fetch_err:
+                print(f"Wikipedia fetch failed for query '{q}': {fetch_err}")
+                continue
 
-    ### EXAMPLES
-    Question: "What caused the 2008 financial crisis?"
-    Output: 2008 financial crisis, subprime mortgage crisis, Lehman Brothers bankruptcy
+        if not all_context:
+            state["tool_output"] = (
+                "Wikipedia search returned no results for this question. "
+                "Try a different tool."
+            )
+        else:
+            budget_per_result = max(500, 3000 // len(all_context))
+            trimmed_context = []
+            for chunk in all_context:
+                if len(chunk) > budget_per_result:
+                    chunk = chunk[:budget_per_result] + "...[Truncated]"
+                trimmed_context.append(chunk)
 
-    Question: "Who invented the telephone?"
-    Output: Alexander Graham Bell, invention of the telephone
+            state["tool_output"] = "Wikipedia Context Found:\n" + "\n".join(trimmed_context)
 
-    ### USER QUESTION
-    {state['question']}
+    except concurrent.futures.TimeoutError:
+        state["tool_output"] = "Wikipedia tool timed out. Try a different tool."
+    except Exception as e:
+        state["tool_output"] = (
+            f"Wikipedia Tool Failure: {str(e)}. Try a different tool."
+        )
 
-    ### OUTPUT (comma-separated terms only):"""
-
-    extracted_str = llm.invoke(extraction_prompt).strip()
-    queries = [q.strip() for q in extracted_str.split(',') if q.strip()]
-    if not queries:
-        queries = [state['question']]
-        
-    # 2. Multi-Step Execution & Aggregation
-    all_context = []
-    sources = set()
-    
-    for q in queries:
-        docs = wiki.fetch(q)
-        for d in docs:
-            all_context.append(f"Title: {d['title']}\nContent: {d['content']}")
-            if d['source'] != "No URL":
-                sources.add(d['source'])
-                
-    # 3. Graceful Error Handling & Final Prompt
-    if not all_context:
-        state["response"] = "I couldn't find information on Wikipedia regarding that."
-        return state
-        
-    context_str = "\n\n---\n\n".join(all_context)
-    
-    # prompt = f"""
-    # Use this aggregated Wikipedia content to answer the user's question:
-
-    # {context_str}
-
-    # User Question: {state['question']}
-    
-    # Instructions:
-    # Answer clearly using ONLY the provided facts. 
-    # At the very end of your answer, append a 'Sources:' section listing the following exact URLs:
-    # {', '.join(sources)}
-    # """
-    sources_list = "\n".join([f"- {s}" for s in sources]) if sources else "- No sources available"
-
-    answer_prompt = f"""### TASK: Answer from Wikipedia Context
-
-    You are a factual research assistant. Using ONLY the Wikipedia content provided below,
-    answer the user's question as accurately and completely as possible.
-
-    ### STRICT RULES
-    1. Use ONLY facts from the provided context. Do not add outside knowledge.
-    2. If the context partially answers the question, state what IS known and clearly flag
-    what is NOT covered: "Note: The provided sources do not mention [X]."
-    3. If the context is entirely irrelevant, reply: "The retrieved Wikipedia content does
-    not contain enough information to answer this question."
-    4. Keep your answer focused. Avoid repeating the same fact in different words.
-    5. Use plain prose. Use bullet points only for lists of 3 or more distinct items.
-
-    ### WIKIPEDIA CONTEXT
-    {context_str}
-
-    ### USER QUESTION
-    {state['question']}
-
-    ### YOUR ANSWER
-    [Write your answer here]
-
-    ### SOURCES
-    {sources_list}"""
-
-    if state.get("stream"):
-        state["response"] = llm.stream(answer_prompt)
-    else:
-        state["response"] = llm.invoke(answer_prompt)
     return state
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NODE: RAG
+# ═══════════════════════════════════════════════════════════════════
 
 @monitored_node("rag")
 def rag_node(state, config):
+    if not config.get("rag"):
+        state["tool_output"] = (
+            "RAG Document service not initialized — no file has been uploaded. "
+            "Try a different tool."
+        )
+        return state
+
     rag_service = config["rag"]
-    llm = LLMService(config["model"])
-
-    context = rag_service.retrieve(state["question"])
-
-    # prompt = f"""
-    # Answer using this context:
-
-    # {context}
-
-    # Question:
-    # {state['question']}
-    # """
-
-    rag_prompt = f"""### TASK: Document Question Answering (RAG)
-
-    You are a precise document analyst. The context below consists of passages retrieved
-    from a user's uploaded document. Answer the user's question using ONLY these passages.
-
-    ### RETRIEVED DOCUMENT PASSAGES
-    {context}
-
-    ### USER QUESTION
-    {state['question']}
-
-    ### INSTRUCTIONS
-    1. Base your answer strictly on the passages above. Do not use outside knowledge.
-    2. If the answer is directly stated in the text, quote the relevant phrase briefly,
-    then explain it in plain language.
-    3. If the answer requires combining information from multiple passages, synthesize
-    them into a single coherent response.
-    4. If the passages do not contain enough information to answer the question, say:
-    "The uploaded document does not appear to contain information about [topic].
-        You may want to upload a more relevant document or rephrase your question."
-    5. Keep your response clear and appropriately concise for the complexity of the question.
-
-    ### ANSWER:"""
-
-    if state.get("stream"):
-        state["response"] = llm.stream(rag_prompt)
-    else:
-        state["response"] = llm.invoke(rag_prompt)
+    try:
+        context = rag_service.retrieve(state["question"])
+        if not context or not str(context).strip():
+            state["tool_output"] = (
+                "RAG retrieval returned empty context for this question. "
+                "The document may not contain relevant information. Try a different tool."
+            )
+        else:
+            state["tool_output"] = f"Retrieved Context from Uploaded Document:\n{context}"
+    except Exception as e:
+        state["tool_output"] = f"RAG Tool Failure: {str(e)}. Try a different tool."
     return state
 
-# def database_node(state, config):
 
-import re
-
-def extract_sql(query_text: str) -> str:
-    # Extract SQL from ```sql block
-    match = re.search(r"```sql(.*?)```", query_text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-
-    # Fallback: extract first SELECT statement
-    match = re.search(r"(SELECT .*?;)", query_text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-
-    return query_text.strip()
+# ═══════════════════════════════════════════════════════════════════
+# NODE: WEBSITE
+# ═══════════════════════════════════════════════════════════════════
 
 @monitored_node("website")
 def website_node(state, config):
+    import re
     urls = state.get("urls") or state.get("url")
-    llm = LLMService(config["model"])
     rag_service = config.get("rag")
 
     if not urls:
-        state["response"] = "Please provide a valid website URL or list of URLs to scrape."
+        question_text = state.get("question", "")
+        extracted_urls = re.findall(r'(https?://[^\s]+)', question_text)
+        if extracted_urls:
+            urls = extracted_urls
+
+    if not urls:
+        state["tool_output"] = (
+            "No URL addresses were provided for web scraping. Try a different tool."
+        )
         return state
 
-    web_service = WebsiteService()
-    result = web_service.fetch(urls, rag_service)
+    try:
+        web_service = WebsiteService()
+        result = web_service.fetch(urls, rag_service)
 
-    # 1. Smart Fallback Branch
-    if result["type"] == "error":
-        import logging
-        logging.warning(f"Website Scraping Failed. Pivoting to Wikipedia Fallback. Error: {result['content']}")
-        wiki = WikipediaService()
-        wiki_docs = wiki.fetch(state["question"])
-        if not wiki_docs:
-            state["response"] = f"Failed to scrape website, and Wikipedia had no relevant information. Original Error: {result['content']}"
-            return state
-            
-        wiki_context = "\n\n".join([f"Title: {d['title']}\nContent: {d['content']}" for d in wiki_docs])
-        sources = set([d['source'] for d in wiki_docs if d['source'] != "No URL"])
-        # prompt = f"""
-        # [FALLBACK MODE] The requested website(s) blocked extraction. Therefore, answer using this Wikipedia content instead:
-        # {wiki_context}
-        # ---
-        # Question: {state['question']}
-        # Answer clearly and cite: {', '.join(sources)}
-        # """
-
-        wiki_fallback_prompt = f"""### TASK: Answer from Wikipedia (Website Fallback)
-
-        Note: The originally requested website could not be accessed. The following content
-        was retrieved from Wikipedia as an alternative source. Answer accordingly.
-
-        ### WIKIPEDIA CONTENT
-        {wiki_context}
-
-        ### USER QUESTION
-        {state['question']}
-
-        ### INSTRUCTIONS
-        1. Clearly inform the user at the start of your response that the website was
-        unavailable and this answer is based on Wikipedia instead.
-        2. Answer the question using only the provided Wikipedia content.
-        3. End your response with a "Sources:" section listing these URLs:
-        {chr(10).join(f'- {s}' for s in sources)}
-
-        ### ANSWER:"""
-
-        if state.get("stream"):
-            state["response"] = llm.stream(wiki_fallback_prompt)
+        if result["type"] == "error":
+            state["tool_output"] = (
+                f"Website scraping failed: {result['content']}. Try a different tool."
+            )
+        elif result["type"] == "rag" and rag_service:
+            context = rag_service.retrieve(state["question"])
+            state["tool_output"] = f"Website Vector Chunk Context:\n{context}"
         else:
-            state["response"] = llm.invoke(wiki_fallback_prompt)
-        return state
-
-    # 2. RAG Branch (Massive Documents)
-    if result["type"] == "rag" and rag_service:
-        context = rag_service.retrieve(state["question"])
-        # prompt = f"""
-        # Use the following retrieved website chunks to answer the user's question:
-        # {context}
-        # ---
-        # Question: {state['question']}
-        # Answer clearly and cite information directly from the provided text.
-        # """
-
-        rag_web_prompt = f"""### TASK: Answer from Indexed Website Chunks
-
-        You are a web research assistant. The passages below are the most relevant sections
-        retrieved from an indexed version of the requested website.
-
-        ### RETRIEVED WEBSITE CHUNKS
-        {context}
-
-        ### USER QUESTION
-        {state['question']}
-
-        ### INSTRUCTIONS
-        1. Synthesize the retrieved chunks to form a complete, accurate answer.
-        2. Ignore any chunk that appears to be navigation, ads, or non-informational text.
-        3. If multiple chunks provide complementary information, combine them coherently.
-        4. Cite specific details (numbers, names, dates) that appear in the chunks.
-        5. If the chunks are insufficient, state what is and isn't covered.
-
-        ### ANSWER:"""
-
-        if state.get("stream"):
-            state["response"] = llm.stream(rag_web_prompt)
-        else:
-            state["response"] = llm.invoke(rag_web_prompt)
-        return state
-
-    # 3. Standard Text Branch (Small/Medium Documents)
-    # prompt = f"""
-    # Use the following aggregated website content to answer the user's question:
-    # {result['content']}
-    # ---
-    # Question: {state['question']}
-    # Answer clearly and cite information directly from the provided text.
-    # """
-
-    standard_prompt = f"""### TASK: Answer from Website Content
-
-    You are a web research assistant. The content below was scraped from the requested
-    website(s). Use it to answer the user's question.
-
-    ### WEBSITE CONTENT
-    {result['content']}
-
-    ### USER QUESTION
-    {state['question']}
-
-    ### INSTRUCTIONS
-    1. Answer using ONLY information present in the website content above.
-    2. Ignore boilerplate text (nav menus, cookie notices, footer text, ads).
-    Focus on the main article or informational content.
-    3. Be specific: if the site mentions numbers, dates, or names relevant to the
-    question, include them.
-    4. If the site content is irrelevant to the question, clearly state:
-    "The scraped content from this website does not address your question."
-    5. Do not fabricate URLs or statistics not present in the content.
-
-    ### ANSWER:"""
-
-    if state.get("stream"):
-        state["response"] = llm.stream(standard_prompt)
-    else:
-        state["response"] = llm.invoke(standard_prompt)
+            state["tool_output"] = f"Website Direct Scraped Text Content:\n{result['content']}"
+    except Exception as e:
+        state["tool_output"] = f"Website Tool Failure: {str(e)}. Try a different tool."
     return state
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NODE: DATABASE
+# ═══════════════════════════════════════════════════════════════════
 
 @monitored_node("database")
 def database_node(state, config):
+    if not config.get("db"):
+        state["tool_output"] = (
+            "Database connection service is uninitialized. Try a different tool."
+        )
+        return state
+
     db_service = config["db"]
     llm = LLMService(config["model"])
-    
-    # 1. Fetch schema and dialect
     schema_info = db_service.get_schema()
     dialect = db_service.get_dialect()
 
-    # 2. Step 1: Generate SQL from Natural Language
-    # sql_gen_prompt = f"""
-    # You are an expert SQL Data Analyst specializing in {dialect} database.
-    # Your task is to convert the user's natural language question into a high-quality, efficient {dialect} SQL query.
-
-    # Database Schema:
-    # {schema_info}
-
-    # User Question: {state['question']}
-
-    # Instructions:
-    # - Use ONLY {dialect} compatible syntax.
-    # - If the user asks to 'summarize' or 'overview' and you query 'sqlite_master', remember that the column name for tables is 'name' (NOT 'TABLE_NAME').
-    # - For summaries, NEVER use 'SELECT *' inside a sub-select or string concatenation (e.g., 'SELECT ... || (SELECT * FROM ...)'). SQLite only allows sub-selects that return a SINGLE column and a SINGLE row in such contexts.
-    # - Instead of complex concatenations, write separate queries or use simple 'SELECT count(*) FROM table' to get metadata.
-    # - If the user asks for a summary, aim for a query that lists table names and their approximate sizes if possible, but keep it simple enough to be valid SQL.
-    # - Do NOT include any explanations or conversation in your response.
-    # - Return ONLY the SQL query.
-    # """
-
-    # Build dialect-specific guardrails dynamically
     dialect_rules = {
-        "sqlite": """
-    - Use only SQLite-compatible syntax.
-    - For schema introspection, use: SELECT name FROM sqlite_master WHERE type='table';
-    - Do NOT use sub-selects that return multiple columns or rows inside string contexts.
-    - For row counts, use: SELECT COUNT(*) FROM table_name;
-    - Do NOT use window functions unless the SQLite version is known to support them.""",
-        "mysql": """
-    - Use only MySQL-compatible syntax.
-    - For schema introspection, use: SHOW TABLES; or SELECT TABLE_NAME FROM information_schema.TABLES;
-    - Use backticks for identifiers, not double quotes.""",
-        "postgresql": """
-    - Use only PostgreSQL-compatible syntax.
-    - For schema introspection, use: SELECT tablename FROM pg_tables WHERE schemaname='public';
-    - Use double quotes for identifiers with special characters.""",
+        "sqlite":     "- Use only SQLite syntax. For schema info, query sqlite_master table.",
+        "mysql":      "- Use MySQL backticks for safe queries. Show tables via SHOW TABLES;",
+        "postgresql": "- Use clean PostgreSQL public schema table identifiers.",
     }
-    dialect_specific = dialect_rules.get(dialect.lower(), f"- Use only {dialect}-compatible syntax.")
+    dialect_specific = dialect_rules.get(dialect.lower(), f"- Use valid {dialect} syntax.")
 
     sql_gen_prompt = f"""### TASK: Natural Language to SQL
+Convert the user query into a valid single executable {dialect} SQL query.
 
-    You are a senior {dialect} database engineer. Convert the user's question into a
-    single, executable {dialect} SQL query using the schema provided.
+### SCHEMA
+{schema_info}
 
-    ### DATABASE SCHEMA
-    {schema_info}
+### DIRECTIONS
+{dialect_specific}
+- Output ONLY raw SQL code. No markdown boxes, no explanations.
+- Append LIMIT 50 to prevent overflow.
 
-    ### DIALECT-SPECIFIC RULES
-    {dialect_specific}
+Question: {state['question']}
+SQL QUERY:"""
 
-    ### UNIVERSAL RULES
-    1. Output ONLY the raw SQL query. No markdown, no backticks, no explanation,
-    no preamble, no trailing text.
-    2. Always add LIMIT 100 to any SELECT query that could return many rows,
-    unless the user explicitly asks for all records.
-    3. Use only table and column names that exist in the schema above. Never invent names.
-    4. If a JOIN is required, use explicit JOIN ... ON syntax, not implicit comma joins.
-    5. If the question is unanswerable with the given schema, output exactly:
-    -- UNANSWERABLE: [one-sentence reason]
-    6. Prefer readability: use table aliases and newlines for complex queries.
+    raw_response = ""
+    clean_sql = ""
 
-    ### USER QUESTION
-    {state['question']}
-
-    ### SQL QUERY:"""
+    def _generate_sql(prompt):
+        raw = _invoke_with_timeout(llm, prompt, timeout_seconds=30).strip()
+        if "```" in raw:
+            match = re.search(r"```sql(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+            return match.group(1).strip() if match else raw.replace("```", "").strip()
+        return raw
 
     try:
-        raw_response = llm.invoke(sql_gen_prompt)
+        # ── SQLite-specific schema helper ──
+        if dialect.lower() == "sqlite" and re.search(r"\b(table|tables|schema|columns|column|describe|list|show)\b", state["question"], re.IGNORECASE):
+            clean_sql = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+        else:
+            raw_response = _generate_sql(sql_gen_prompt)
+            clean_sql = raw_response
+
+        last_error = None
+        for attempt in range(2):
+            try:
+                sql_result = db_service.execute(clean_sql)
+                state["tool_output"] = (
+                    f"Executed SQL Query: {clean_sql}\nSQL Output Raw Data: {sql_result}"
+                )
+                return state
+            except Exception as exec_err:
+                last_error = exec_err
+                if attempt == 0:
+                    print(f"SQL attempt 1 failed: {exec_err}. Auto-correcting...")
+                    if dialect.lower() == "sqlite" and "sqlite_master" not in clean_sql:
+                        clean_sql = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+                    else:
+                        fix_prompt = f"""### TASK: SQL Error Correction
+The following SQL query failed. Rewrite it to fix the problem.
+
+### ORIGINAL QUERY:
+{clean_sql}
+
+### ERROR MESSAGE:
+{str(exec_err)}
+
+### SCHEMA:
+{schema_info}
+
+Output ONLY the corrected raw SQL. No markdown, no explanation.
+CORRECTED SQL:"""
+                        try:
+                            clean_sql = _generate_sql(fix_prompt)
+                        except Exception:
+                            break
+
+        state["tool_output"] = (
+            f"Database Tool Failed after auto-correction. "
+            f"Last query: {clean_sql}\nError: {str(last_error)}. "
+            "Try a different tool."
+        )
+
+    except concurrent.futures.TimeoutError:
+        state["tool_output"] = "Database SQL generation timed out. Try a different tool."
     except Exception as e:
-        state["response"] = f"LLM Generation Error: {str(e)}"
-        return state
+        state["tool_output"] = (
+            f"Database Tool Exception: {str(e)} on query: {raw_response}. "
+            "Try a different tool."
+        )
 
-    # 3. Step 2: Strict SQL Parsing & Refinement
-    # This ensures no natural language 'noise' remains in the final query.
-    # refine_prompt = f"""
-    # You are a strict SQL extractor. 
-    # From the following text, extract ONLY the executable {dialect} SQL query.
-    # Remove any markdown formatting (like ```sql), conversational text, or explanations.
-    # If multiple queries are present, return only the most relevant one.
-    
-    # Raw Text:
-    # {raw_response}
-    
-    # Executable SQL:
-    # """
+    return state
 
-    refine_prompt = f"""### TASK: SQL Extraction and Validation
 
-    From the raw text below, extract the single executable {dialect} SQL query.
+# ═══════════════════════════════════════════════════════════════════
+# HELPER: GENERATE NEXT-STEP SUGGESTIONS
+# ═══════════════════════════════════════════════════════════════════
 
-    ### RAW TEXT
-    {raw_response}
+def _generate_suggestions(llm, question: str, answer: str, config: dict) -> str:
+    """
+    Calls the LLM to generate 3 contextual follow-up suggestions based on
+    the question that was just answered and the tools available in the session.
+    Returns a formatted markdown block ready to append to the final response.
+    """
+    available = []
+    if config.get("rag"):
+        available.append("uploaded document (RAG)")
+    if config.get("db"):
+        available.append("database queries")
+    if config.get("wikipedia"):
+        available.append("Wikipedia")
+    available.append("website scraping")
 
-    ### EXTRACTION RULES
-    1. Remove ALL markdown formatting: backticks, ```sql blocks, language tags.
-    2. Remove all natural language text, comments, and explanations.
-    3. If multiple SQL statements are present, return only the LAST one
-    (it is typically the most refined version).
-    4. If the raw text contains "-- UNANSWERABLE:", return that line exactly as-is.
-    5. If no valid SQL can be extracted, return exactly: SELECT 'extraction_failed' AS error;
-    6. Do NOT modify the SQL logic — only clean up formatting.
-    7. Output ONLY the final SQL. No labels, no explanation, no punctuation after the query.
+    available_str = ", ".join(available)
 
-    ### EXTRACTED SQL:"""
+    suggestions_prompt = f"""### TASK: Generate Follow-Up Suggestions
+Based on the user's question and the answer just given, suggest exactly 3 concise,
+actionable follow-up questions the user could ask next.
+
+The system has these capabilities available: {available_str}.
+Tailor suggestions to what can realistically be answered using these capabilities.
+
+### USER'S ORIGINAL QUESTION:
+{question}
+
+### ANSWER JUST PROVIDED (summary):
+{answer[:800]}
+
+### RULES:
+- Output ONLY a valid JSON array of exactly 3 short question strings.
+- Each question must be under 15 words.
+- Do not include numbering, bullet points, markdown, or any text outside the JSON array.
+- Format exactly like this: ["Question one?", "Question two?", "Question three?"]
+
+### OUTPUT:"""
 
     try:
-        clean_sql = llm.invoke(refine_prompt).strip()
-        # Edge case: sometimes it still adds markdown
-        if "```" in clean_sql:
-            import re
-            match = re.search(r"```sql(.*?)```", clean_sql, re.DOTALL | re.IGNORECASE)
-            if match:
-                clean_sql = match.group(1).strip()
-            else:
-                clean_sql = clean_sql.replace("```sql", "").replace("```", "").strip()
+        raw = _invoke_with_timeout(llm, suggestions_prompt, timeout_seconds=20)
+        # Extract JSON array from the response
+        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        if match:
+            import json
+            suggestions = json.loads(match.group())
+            if isinstance(suggestions, list) and len(suggestions) >= 1:
+                lines = "\n".join(f"- {s}" for s in suggestions[:3])
+                return f"\n\n---\n**💡 You could ask next:**\n{lines}"
     except Exception as e:
-        state["response"] = f"SQL Parsing Error: {str(e)}"
-        return state
+        print(f"Suggestions generation failed (non-critical): {e}")
 
-    # 4. Execute the refined SQL
-    try:
-        sql_result = db_service.execute(clean_sql)
-    except Exception as e:
-        state["response"] = f"SQL Execution Error: {str(e)}\nExecuted SQL: {clean_sql}"
-        return state
+    return ""  # Graceful fallback — answer is still returned without suggestions
 
-    # 5. Step 3: Synthesis (Natural Language Interpretation)
-    synthesis_prompt = f"""### TASK: SQL Result Interpretation
+
+# ═══════════════════════════════════════════════════════════════════
+# NODE: FINAL SYNTHESIS
+# ═══════════════════════════════════════════════════════════════════
+
+@monitored_node("final_synthesis")
+def final_synthesis_node(state: dict, config: dict) -> dict:
+    llm = LLMService(config["model"], temperature=state.get("temperature", 0.5))
+
+    scratchpad = state.get("agent_scratchpad", "")
     
-    You are a data analyst. Based on the user's question and the raw data retrieved
-    from the database, provide a clear, helpful, and natural language response.
+    # Include ambiguity hints from context discovery
+    ambiguity_hints = state.get("_ambiguity_hints", {})
+    clarification_context = ""
+    if state.get("_clarification_needed"):
+        hints = ambiguity_hints.get("suggested_questions", [])
+        if hints:
+            clarification_context = (
+                "\n\n**NOTE: The original user query was somewhat ambiguous. "
+                "Consider addressing these perspectives in your response:**\n"
+                + "\n".join(f"- {h}" for h in hints[:2])
+            )    
+    # ── NEW: Include uploaded SQL file info for file info questions ──
+    context_clues = state.get("_context_clues", {})
+    sql_file_context = ""
+    if context_clues.get("uploaded_sql_files"):
+        sql_preview = context_clues.get("uploaded_sql_preview", "")
+        sql_files = context_clues.get("uploaded_sql_files", [])
+        sql_table_count = context_clues.get("uploaded_sql_table_count", 0)
+        sql_size = context_clues.get("uploaded_sql_size", 0)
+        
+        sql_file_context = f"""
 
-    ### USER QUESTION
-    {state['question']}
+### UPLOADED SQL FILE INFORMATION (available for analysis):
+**Files:** {', '.join(sql_files)}
+**Tables:** {sql_table_count}
+**Size:** {sql_size} bytes
 
-    ### EXECUTED SQL
-    {clean_sql}
+**Preview (first 2000 chars):**
+```sql
+{sql_preview}
+```
+"""
+    # Evidence gate: detect whether any tool returned real data
+    EVIDENCE_KEYWORDS = [
+        "Retrieved Context",
+        "Wikipedia Context Found",
+        "SQL Output Raw Data",
+        "Website Direct Scraped",
+        "Website Vector Chunk",
+    ]
+    has_real_data = any(kw in scratchpad for kw in EVIDENCE_KEYWORDS)
 
-    ### RAW SQL DATA
-    {sql_result}
+    # Include last 6 messages of conversation history for continuity
+    history = state.get("history", [])
+    history_text = ""
+    if history:
+        formatted = [
+            f"{'User' if h.get('role') == 'user' else 'Assistant'}: {h.get('content', '')}"
+            for h in history[-6:]
+        ]
+        history_text = "\n".join(formatted)
 
-    ### INSTRUCTIONS
-    1. Summarize the data in a way that directly answers the user's question.
-    2. If the data is a table, describe the key findings or trends.
-    3. Use a professional yet conversational tone.
-    4. If the data is empty, explain that no matching records were found.
-    5. Do not mention technical details like SQL syntax or table names unless necessary.
-    6. If the data contains specific numbers or units, include them accurately.
+    # No-evidence path: give an honest answer instead of a hallucinated one
+    if not has_real_data:
+        no_data_prompt = f"""### TASK: Honest Failure Summary OR File Analysis
+You are a helpful AI assistant. If tools didn't return data, give an honest explanation.
+However, if the user is asking about an uploaded SQL file, provide analysis of that file instead.
 
-    ### FINAL ANSWER:"""
+### WHAT WAS ATTEMPTED:
+{scratchpad if scratchpad else "No tools were successfully invoked."}
+
+### USER'S QUESTION:
+{state['question']}{sql_file_context}
+
+### INSTRUCTIONS:
+1. If SQL file info is provided and question is about it, analyze and describe the SQL file structure.
+2. Otherwise, be honest that the information could not be retrieved this time.
+3. Briefly explain what was tried (without exposing raw errors or stack traces).
+4. Suggest 1-2 concrete things the user could do to get a better result
+   (e.g. rephrase the question, upload a specific document, provide a URL).
+5. Keep the tone warm and professional.
+
+### RESPONSE:"""
+
+        try:
+            honest_answer = _invoke_with_timeout(llm, no_data_prompt, timeout_seconds=45)
+        except concurrent.futures.TimeoutError:
+            honest_answer = (
+                "I was unable to retrieve relevant information for your question this time. "
+                "Please try rephrasing, uploading a relevant document, or providing a direct URL."
+            )
+        except Exception as e:
+            honest_answer = f"Unable to generate a response: {str(e)}"
+
+        # Still append suggestions even on failure path
+        suggestions_block = _generate_suggestions(llm, state["question"], honest_answer, config)
+        state["response"] = honest_answer + suggestions_block
+        return state
+
+    # ── Normal synthesis path (evidence exists) ─────────────────────
+    synthesis_prompt = f"""### TASK: Final Informational Synthesis
+You are a polished data consultant. Review the execution trace scratchpad containing
+all tool results, then write a comprehensive, professional final answer.
+
+### PRIOR CONVERSATION CONTEXT:
+{history_text if history_text else "No prior conversation history."}
+
+### ACTIONS & TOOL RESULTS RECORD:
+{scratchpad}
+
+### ORIGINAL USER QUESTION:
+{state['question']}{sql_file_context}
+
+### INSTRUCTIONS:
+1. Write a professional markdown-formatted response that directly answers the question.
+2. Use only the data returned by the tools shown in the scratchpad. Do not hallucinate.
+3. If some steps failed, gracefully work around them using the data that did succeed.
+4. Reference prior conversation context where it adds useful continuity.
+5. If the question is about an uploaded SQL file and info is provided above, include that analysis.
+6. Do NOT include follow-up suggestions here — they will be appended separately.{clarification_context}
+
+### FINAL ANSWER:"""
 
     try:
         if state.get("stream"):
-            state["response"] = llm.stream(synthesis_prompt)
-        else:
-            state["response"] = llm.invoke(synthesis_prompt)
+            def response_generator():
+                full_text = ""
+                # 1. Yield the main synthesized response as it streams
+                for chunk in llm.stream(synthesis_prompt):
+                    full_text += chunk
+                    yield chunk
+                
+                # 2. Once streaming is done, generate suggestions based on the full text
+                suggestions_block = _generate_suggestions(llm, state["question"], full_text, config)
+                if suggestions_block:
+                    yield suggestions_block
+            
+            state["response"] = response_generator()
+            return state
+
+        answer = _invoke_with_timeout(llm, synthesis_prompt, timeout_seconds=60)
+
+        # Append contextual next-step suggestions to every non-streamed response
+        suggestions_block = _generate_suggestions(llm, state["question"], answer, config)
+        state["response"] = answer + suggestions_block
+
+    except concurrent.futures.TimeoutError:
+        state["response"] = (
+            "The synthesis step timed out. Here is the raw gathered data:\n\n" + scratchpad
+        )
     except Exception as e:
-        state["response"] = f"Synthesis Error: {str(e)}\nRaw Data: {sql_result}"
+        state["response"] = f"Synthesis failed: {str(e)}"
 
     return state

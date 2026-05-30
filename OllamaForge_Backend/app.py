@@ -263,6 +263,127 @@ def init_database():
 # MAIN CHAT ENDPOINT
 # --------------------------------------------------
 
+# @app.route("/api/chat", methods=["POST"])
+# def chat():
+#     data = request.get_json()
+#     session_id = data.get("session_id")
+#     message = data.get("message")
+#     urls = data.get("urls") or data.get("url")
+#     system_prompt = data.get("system_prompt", "")
+#     temperature = data.get("temperature", 0.5)
+#     stream_flag = data.get("stream", False)
+
+#     session = get_session(session_id)
+#     print("SESSION:", session)
+#     if not session:
+#         return jsonify({"error": "Session not found"}), 400
+
+#     history = get_messages(session_id)
+
+#     rag_service = None
+#     db_service = None
+
+#     # ---------- RAG ----------
+#     if session["source"] == "RAG":
+
+#         if not session.get("rag_path"):
+#             return jsonify({"error": "No document uploaded for RAG mode"}), 400
+
+#         rag_service = RAGService(session_id, VECTORSTORE_DIR)
+
+#         if not rag_service.load():
+#             return jsonify({
+#                 "error": "Vectorstore missing. Please re-upload document."
+#             }), 400
+
+#     # ---------- DATABASE ----------
+#     if session["source"] == "Database":
+#         if not session.get("db_path"):
+#             return jsonify({"error": "Database not initialized"}), 400
+
+#         db_service = DatabaseService(session["db_path"])
+
+#     # ---------- WEBSITE ----------
+#     if session["source"] == "Website":
+#         # Fallback to connected URL if none provided in request
+#         if not urls and session.get("rag_path"):
+#             urls = session["rag_path"]
+            
+#         # Initialize an empty RAGService just in case we hit an enormous website and need to chunk it.
+#         rag_service = RAGService(session_id, VECTORSTORE_DIR)
+
+#     graph = build_graph(
+#         session["source"],
+#         {
+#             "model": session["model"],
+#             "temperature": temperature,
+#             "wikipedia": WikipediaService(),  # Wikipedia node doesn't require initialization
+#             "rag": rag_service,
+#             "db": db_service
+#         }
+#     )
+
+#     start_time = time.time()
+    
+#     initial_state = {
+#         "question": message,
+#         "response": "",
+#         "history": history,
+#         "urls": urls,
+#         "system_prompt": system_prompt,
+#         "stream": stream_flag,
+#         "next_action": "",
+#         "tool_output": "",
+#         "agent_scratchpad": ""
+#     }
+
+#     if stream_flag:
+#         from flask import Response
+#         def generate():
+#             try:
+#                 result = graph.invoke(initial_state)
+#                 response_obj = result["response"]
+                
+#                 full_response = ""
+                
+#                 # If the response is a generator (streaming LLM)
+#                 if hasattr(response_obj, '__iter__') and not isinstance(response_obj, (str, list, dict, set)):
+#                     for chunk in response_obj:
+#                         full_response += chunk
+#                         data = json.dumps({"content": chunk})
+#                         yield f"data: {data}\n\n"
+#                 else:
+#                     # If the response is a string (e.g. Database result or error)
+#                     full_response = str(response_obj)
+#                     data = json.dumps({"content": full_response})
+#                     yield f"data: {data}\n\n"
+                
+#                 total_time = time.time() - start_time
+#                 log_graph_summary(session_id, total_time)
+#                 save_message(session_id, "user", message)
+#                 save_message(session_id, "assistant", full_response)
+#             except Exception as e:
+#                 logger.error(f"Error in streaming generation: {str(e)}")
+#                 data = json.dumps({"error": str(e)})
+#                 yield f"data: {data}\n\n"
+            
+#         return Response(generate(), mimetype="text/event-stream")
+        
+#     else:
+#         # Standard Synchronous Generation
+#         try:
+#             result = graph.invoke(initial_state)
+#             total_time = time.time() - start_time
+#             log_graph_summary(session_id, total_time)
+#             response = result["response"]
+#             save_message(session_id, "user", message)
+#             save_message(session_id, "assistant", response)
+#             return jsonify({"response": response})
+#         except Exception as e:
+#             logger.error(f"Error in chat endpoint: {str(e)}")
+#             return jsonify({"error": f"Failed to generate response: {str(e)}"}), 500
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json()
@@ -274,111 +395,142 @@ def chat():
     stream_flag = data.get("stream", False)
 
     session = get_session(session_id)
-    print("SESSION:", session)
     if not session:
         return jsonify({"error": "Session not found"}), 400
 
     history = get_messages(session_id)
 
+    # Instantiate ALL initialized services to make them available to the Agentic runtime environment
     rag_service = None
-    db_service = None
-
-    # ---------- RAG ----------
-    if session["source"] == "RAG":
-
-        if not session.get("rag_path"):
-            return jsonify({"error": "No document uploaded for RAG mode"}), 400
-
+    rag_path = session.get("rag_path")
+    if rag_path:
         rag_service = RAGService(session_id, VECTORSTORE_DIR)
-
         if not rag_service.load():
-            return jsonify({
-                "error": "Vectorstore missing. Please re-upload document."
-            }), 400
+            logger.warning(
+                f"Session {session_id}: RAG vectorstore failed to load. Path={rag_path}."
+            )
+            if session.get("source") == "RAG":
+                error_msg = (
+                    "RAG document database could not be loaded. "
+                    "Please re-upload the file or rebuild the vectorstore."
+                )
+                return jsonify({"error": error_msg}), 500
+            rag_service = None
+    elif session.get("source") == "RAG":
+        return jsonify({"error": "No document uploaded for RAG mode. Please upload a PDF or DOCX first."}), 400
 
-    # ---------- DATABASE ----------
-    if session["source"] == "Database":
-        if not session.get("db_path"):
-            return jsonify({"error": "Database not initialized"}), 400
+    db_service = None
+    if session.get("db_path"):
+        db_path = session.get("db_path", "").strip()
+        
+        # ── Handle .sql files that haven't been processed yet ──
+        if db_path.endswith(".sql"):
+            logger.info(
+                f"Session {session_id}: SQL file uploaded but not yet processed into a database. "
+                f"File: {db_path}. User needs to call /api/init_database to convert it."
+            )
+            if session.get("source") == "Database":
+                return jsonify({
+                    "error": "SQL file detected but not yet processed into a database. "
+                             "Please call the /api/init_database endpoint with the SQL file path first."
+                }), 400
+            # If source is not Database, skip database initialization
+            db_service = None
+        
+        # ── Validate that db_path is a proper SQLAlchemy URI ──
+        elif not db_path or not (db_path.startswith("sqlite://") or "://" in db_path):
+            logger.warning(
+                f"Session {session_id}: Invalid database URI format. Path={db_path}."
+            )
+            if session.get("source") == "Database":
+                return jsonify({"error": "Database URI is invalid or not initialized properly."}), 400
+            # If source is not Database, db_service remains None
+        else:
+            try:
+                db_service = DatabaseService(db_path)
+            except Exception as db_err:
+                logger.warning(
+                    f"Session {session_id}: Failed to initialize database service. Error: {db_err}"
+                )
+                if session.get("source") == "Database":
+                    return jsonify({"error": f"Database connection failed: {str(db_err)}"}), 500
+                db_service = None
+    elif session.get("source") == "Database":
+        return jsonify({"error": "Database not initialized. Please set up a database connection first."}), 400
 
-        db_service = DatabaseService(session["db_path"])
+    # Build dynamic multi-tool contextual environment mapping configurations
+    graph_config = {
+        "model": session["model"],
+        "session_id": session_id,
+        "temperature": temperature,
+        "wikipedia": WikipediaService(),
+        "rag": rag_service,
+        "db": db_service
+    }
 
-    # ---------- WEBSITE ----------
-    if session["source"] == "Website":
-        # Fallback to connected URL if none provided in request
-        if not urls and session.get("rag_path"):
-            urls = session["rag_path"]
-            
-        # Initialize an empty RAGService just in case we hit an enormous website and need to chunk it.
-        rag_service = RAGService(session_id, VECTORSTORE_DIR)
-
-    graph = build_graph(
-        session["source"],
-        {
-            "model": session["model"],
-            "temperature": temperature,
-            "wikipedia": WikipediaService(),  # Wikipedia node doesn't require initialization
-            "rag": rag_service,
-            "db": db_service
-        }
-    )
-
+    graph = build_graph(session["source"], graph_config)
     start_time = time.time()
     
+    # Fully initialize core properties to avoid graph mutation KeyError bugs
     initial_state = {
         "question": message,
         "response": "",
         "history": history,
         "urls": urls,
         "system_prompt": system_prompt,
-        "stream": stream_flag
+        "stream": stream_flag,
+        "temperature": temperature,
+        "next_action": "",
+        "tool_output": "",
+        "agent_scratchpad": "",
+        # Context discovery fields (initialized empty; populated by discover_context node)
+        "_context_clues": {},
+        "_workspace_context": "",
+        "_clarification_needed": False,
+        "_clarification_questions": [],
     }
 
     if stream_flag:
-        from flask import Response
         def generate():
             try:
                 result = graph.invoke(initial_state)
                 response_obj = result["response"]
-                
                 full_response = ""
                 
-                # If the response is a generator (streaming LLM)
                 if hasattr(response_obj, '__iter__') and not isinstance(response_obj, (str, list, dict, set)):
                     for chunk in response_obj:
                         full_response += chunk
-                        data = json.dumps({"content": chunk})
-                        yield f"data: {data}\n\n"
+                        yield f"data: {json.dumps({'content': chunk})}\n\n"
                 else:
-                    # If the response is a string (e.g. Database result or error)
                     full_response = str(response_obj)
-                    data = json.dumps({"content": full_response})
-                    yield f"data: {data}\n\n"
+                    yield f"data: {json.dumps({'content': full_response})}\n\n"
                 
-                total_time = time.time() - start_time
-                log_graph_summary(session_id, total_time)
+                log_graph_summary(session_id, time.time() - start_time)
                 save_message(session_id, "user", message)
                 save_message(session_id, "assistant", full_response)
             except Exception as e:
                 logger.error(f"Error in streaming generation: {str(e)}")
-                data = json.dumps({"error": str(e)})
-                yield f"data: {data}\n\n"
+                error_msg = str(e)
+                if "429" in error_msg and ("quota" in error_msg.lower() or "resource_exhausted" in error_msg.lower()):
+                    error_msg = "API Quota Exceeded: You have reached the rate limit or quota for the Gemini API. Please check your Google AI billing and plan."
+                yield f"data: {json.dumps({'error': error_msg})}\n\n"
             
         return Response(generate(), mimetype="text/event-stream")
         
     else:
-        # Standard Synchronous Generation
         try:
             result = graph.invoke(initial_state)
-            total_time = time.time() - start_time
-            log_graph_summary(session_id, total_time)
             response = result["response"]
+            log_graph_summary(session_id, time.time() - start_time)
             save_message(session_id, "user", message)
             save_message(session_id, "assistant", response)
             return jsonify({"response": response})
         except Exception as e:
             logger.error(f"Error in chat endpoint: {str(e)}")
-            return jsonify({"error": f"Failed to generate response: {str(e)}"}), 500
+            error_msg = str(e)
+            if "429" in error_msg and ("quota" in error_msg.lower() or "resource_exhausted" in error_msg.lower()):
+                error_msg = "API Quota Exceeded: You have reached the rate limit or quota for the Gemini API. Please check your Google AI billing and plan."
+            return jsonify({"error": error_msg}), 500
 
 # --------------------------------------------------
 # RUN APPLICATION
